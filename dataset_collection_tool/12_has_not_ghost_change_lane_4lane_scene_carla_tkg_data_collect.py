@@ -1,0 +1,733 @@
+import carla
+import time
+import torch
+import keyboard  # 用于捕获键盘输入
+import cv2
+import re
+import math
+import numpy as np
+import os
+
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+from TKG.AutoVehicle_KG_Function_3D_simple_version_V2 import AVKG_3D_simple
+
+# 定义图像的宽度和高度
+image_width = 1600
+image_height = 1200
+
+
+def find_weather_presets():
+    rgx = re.compile('.+?(?:(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|$)')    # rgx 是一个正则表达式对象，用于将驼峰式命名的字符串分割为单词。
+    name = lambda x: ' '.join(m.group(0) for m in rgx.finditer(x))      # 定义一个匿名函数 name，它将字符串 x 中根据正则表达式匹配出的部分组合成用空格分隔的单词。
+    presets = [x for x in dir(carla.WeatherParameters) if re.match('[A-Z].+', x)]   # 使用 dir() 列出 carla.WeatherParameters 中所有以大写字母开头的属性，保存在 presets 列表中。
+    # print([(getattr(carla.WeatherParameters, x), name(x)) for x in presets])
+    return [(getattr(carla.WeatherParameters, x), name(x)) for x in presets]   # 返回一个列表，列表的每一项是 (属性值, 属性名) 的元组，属性名通过正则表达式分割后变得更易读。
+
+
+def calculate_angle_between_vectors(vector_a, vector_b):
+    """计算两个向量之间的夹角（以度数表示），返回值在 -180 到 180 度之间。"""
+    dot_product = vector_a.x * vector_b.x + vector_a.y * vector_b.y
+    magnitude_a = math.sqrt(vector_a.x ** 2 + vector_a.y ** 2)
+    magnitude_b = math.sqrt(vector_b.x ** 2 + vector_b.y ** 2)
+    if magnitude_a * magnitude_b == 0:
+        return 0
+    angle = math.acos(dot_product / (magnitude_a * magnitude_b))  # 结果以弧度为单位
+    angle_degrees = math.degrees(angle)
+
+    # 确定方向（根据叉乘的z分量）
+    cross_product_z = vector_a.x * vector_b.y - vector_a.y * vector_b.x
+    if cross_product_z < 0:
+        angle_degrees = -angle_degrees
+
+    return angle_degrees
+
+def process_image(image):
+    """处理CARLA采集的图像，并转换为OpenCV格式。"""
+    image_data = np.frombuffer(image.raw_data, dtype=np.uint8)
+    image_data = image_data.reshape((image.height, image.width, 4))  # BGRA格式
+    return image_data[:, :, :3]  # 只保留BGR通道
+
+def resize_image(image, width, height):
+    """调整图像大小。"""
+    return cv2.resize(image, (width, height))
+
+
+
+def main():
+    # 连接到CARLA服务器
+    client = carla.Client('localhost', 2000)
+    client.set_timeout(10.0)    # 设置超时时间
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # print('TRGCN model will loading on the:',device)
+    # mrgcn = MRGCN().to(device)
+    # # 计算模型的总参数量
+    # total_params = sum(p.numel() for p in mrgcn.parameters())
+    # print(f"Total number of parameters of MRGCN: {total_params}")  # 1283158
+
+    ####################### 7 layer list #########################
+    #######
+    road_structure_list = (
+        "straight", ("road_region", "road_curve", "road_direction")
+    )
+    #######
+    road_facility_list = (
+        # lane
+        (("lane_1", ("l_1_type", "l_1_direction", "l_1_puepose", "l_1_width")),
+         ("lane_2", "lane_1", ("l_2_type", "l_2_direction", "l_2_puepose", "l_2_width")),
+         ("lane_3", "lane_2", ("l_3_type", "l_3_direction", "l_3_puepose", "l_3_width")),
+         ("lane_4", "lane_3", ("l_4_type", "l_4_direction", "l_4_puepose", "l_4_width")),),
+        # "marker"
+        (("marker_1", ("m_1_type", "m_1_color", "m_1_quality")),
+         ("marker_2", ("m_2_type", "m_2_color", "m_2_quality")),),
+        # "sign"
+        (("sign_1", "s_1_type"),
+         ("sign_2", "s_2_type"),),
+        # "light"
+        ("light-s", "light-state", "red"),
+        # "barrier"
+        ("barrier_1",
+         "barrier_2",)
+    )
+    ########
+    road_change_list = ()
+
+    ######
+    digital_information_list = (
+        "communication_quality",
+    )
+
+    # dangerous
+    dangerous_type = [[1, 0],  # 安全          0
+                     [0, 1]]  # 鬼探头            3
+
+    # 打开文件并写入矩阵数据
+    file_path = 'TKG_dataset/'
+    txt_number = 1460
+
+    try:
+        # 加载Town04地图
+        world = client.load_world('Town04')
+
+        # 天气   preset是一个列表，其中第一个元素是设置信息，第二个元素是名称
+        preset = find_weather_presets()
+        print('Carla has below kinds of weather: ')
+        print(preset)
+        print('Current weather is: ',preset[1][1])
+        world.set_weather(preset[2][0])
+
+        ##########   天气的内容
+        weather_list = (
+            "weather-attr", preset[2][1], ("w_direction", "w_level")
+        )
+
+        #########  交通参与者列表
+        traffic_participants_list =()
+
+        ego_information_list = ()
+
+        ############ 生成自车 #########
+        # 获取车辆蓝图
+        blueprint_library = world.get_blueprint_library()
+        vehicle_bp = blueprint_library.filter('vehicle.*')[0]
+        # 选择一个出生点
+        spawn_points = world.get_map().get_spawn_points()
+        spawn_point = spawn_points[300] if len(spawn_points) > 300 else spawn_points[0]
+        # 生成车辆
+        ego_vehicle = world.spawn_actor(vehicle_bp, spawn_point)
+        # 创建摄像头蓝图
+        camera_bp = blueprint_library.find('sensor.camera.rgb')
+        camera_bp.set_attribute('image_size_x', str(image_width))
+        camera_bp.set_attribute('image_size_y', str(image_height))
+        camera_bp.set_attribute('fov', '90')
+        # 添加顶置俯视摄像头
+        top_view_transform = carla.Transform(carla.Location(z=50), carla.Rotation(pitch=-90))
+        top_view_camera = world.spawn_actor(camera_bp, top_view_transform, attach_to=ego_vehicle)
+
+        # 创建俯视图像
+        top_view_image = None
+        def top_view_callback(image):
+            nonlocal top_view_image
+            top_view_image = process_image(image)
+        top_view_camera.listen(top_view_callback)
+
+
+        ######################### 创建前车 ##########################
+        front_vehicle_bp = blueprint_library.filter('vehicle.*')[0]
+        spawn_point_front = spawn_points[301] if len(spawn_points) > 300 else spawn_points[0]
+        # 计算新的位置，前方移动10米
+        forward_vector = spawn_point_front.get_forward_vector()  # 获取生成点的前方向量
+        new_location = spawn_point_front.location + forward_vector * 18.0  # 向前移动80米
+        spawn_point_front.location = new_location  # 更新生成点位置
+        # 生成前方的车辆
+        front_vehicle = world.spawn_actor(front_vehicle_bp, spawn_point_front)
+
+        ######################### 创建车流 ##########################
+        # # # other-1
+        other_vehicle_bp = blueprint_library.filter('vehicle.*')[9]
+        spawn_point_other = spawn_points[298] if len(spawn_points) > 300 else spawn_points[0]
+        # 计算新的位置，前方移动10米
+        forward_distence = spawn_point_other.get_forward_vector()  # 获取生成点的前方向量
+        new_location_other = spawn_point_other.location + forward_distence *70.0  # 向前移动80米
+        spawn_point_other.location = new_location_other  # 更新生成点位置
+        # 生成前方的车辆
+        other_vehicle = world.spawn_actor(other_vehicle_bp, spawn_point_other)
+        #
+        # #
+        # # # other-2
+        other_vehicle_bp_2 = blueprint_library.filter('vehicle.*')[0]
+        spawn_point_other_2 = spawn_points[299] if len(spawn_points) > 300 else spawn_points[0]
+        # 计算新的位置，前方移动10米
+        forward_distence_2 = spawn_point_other_2.get_forward_vector()  # 获取生成点的前方向量
+        new_location_other_2 = spawn_point_other_2.location + forward_distence_2 *20.0  # 向前移动80米
+        spawn_point_other_2.location = new_location_other_2  # 更新生成点位置
+        # 生成前方的车辆
+        other_vehicle_2 = world.spawn_actor(other_vehicle_bp_2, spawn_point_other_2)
+        # #
+        # # other-3
+        other_vehicle_bp_3 = blueprint_library.filter('vehicle.*')[0]
+        spawn_point_other_3 = spawn_points[300] if len(spawn_points) > 300 else spawn_points[0]
+        # 计算新的位置，前方移动10米
+        forward_distence_3 = spawn_point_other_3.get_forward_vector()  # 获取生成点的前方向量
+        new_location_other_3 = spawn_point_other_3.location + forward_distence_3 * 30.0  # 向前移动80米
+        spawn_point_other_3.location = new_location_other_3  # 更新生成点位置
+        # 生成前方的车辆
+        other_vehicle_3 = world.spawn_actor(other_vehicle_bp_3, spawn_point_other_3)
+        #
+        # # # other-4
+        # other_vehicle_bp_4 = blueprint_library.filter('vehicle.*')[0]
+        # spawn_point_other_4 = spawn_points[298] if len(spawn_points) > 300 else spawn_points[0]
+        # # 计算新的位置，前方移动10米
+        # forward_distence_4 = spawn_point_other_4.get_forward_vector()  # 获取生成点的前方向量
+        # new_location_other_4 = spawn_point_other_4.location - forward_distence_4 * 20.0  # 向前移动80米
+        # spawn_point_other_4.location = new_location_other_4  # 更新生成点位置
+        # # 生成前方的车辆
+        # other_vehicle_4 = world.spawn_actor(other_vehicle_bp_4, spawn_point_other_4)
+
+
+        ######################## 生成行人 ############################
+        walker_bp = blueprint_library.filter('walker.pedestrian.*')[0]  # 选择一个行人蓝图
+        walker_spawn_point = carla.Transform(
+            carla.Location(
+                x=new_location.x + forward_vector.x * 141.0,
+                y=new_location.y + forward_vector.x * 4 ,
+                z=new_location.z
+            ),carla.Rotation(yaw=90)
+        )
+        # 生成行人
+        walker = world.try_spawn_actor(walker_bp, walker_spawn_point)
+
+
+        # 启动自动驾驶功能
+        ego_control = carla.VehicleControl()
+        ego_control.throttle = 0.72 # 设置初始油门值, 0 到 1 之间
+        ego_vehicle.apply_control(ego_control)
+        # ego_vehicle.set_autopilot(True)
+
+        front_control = carla.VehicleControl()
+        front_control.throttle = 0.72  # 设置初始油门值, 0 到 1 之间
+        front_vehicle.apply_control(front_control)
+
+        other_vehicle_control = carla.VehicleControl()
+        other_vehicle_control.throttle = 0.72  # 设置初始油门值, 0 到 1 之间
+        other_vehicle.apply_control(other_vehicle_control)
+        # #
+        other_vehicle_control2 = carla.VehicleControl()
+        other_vehicle_control2.throttle = 0.72  # 设置初始油门值, 0 到 1 之间
+        other_vehicle_2.apply_control(other_vehicle_control2)
+        # #
+        other_vehicle_control3 = carla.VehicleControl()
+        other_vehicle_control3.throttle = 0.72  # 设置初始油门值, 0 到 1 之间
+        other_vehicle_3.apply_control(other_vehicle_control3)
+        # #
+        # other_vehicle_control4 = carla.VehicleControl()
+        # other_vehicle_control4.throttle = 0.7  # 设置初始油门值, 0 到 1 之间
+        # other_vehicle_4.apply_control(other_vehicle_control4)
+        # front_vehicle.set_autopilot(True)
+        # other_vehicle.set_autopilot(True)
+        # other_vehicle_2.set_autopilot(True)
+        # other_vehicle_3.set_autopilot(True)
+        # other_vehicle_4.set_autopilot(True)
+        print("在主车右前方 20 米生成了一个自动驾驶车辆。")
+        print("车辆已启动自动驾驶。按 'Esc' 键退出程序。")
+
+        # 让行人向y方向移动
+        print("行人开始移动...")
+
+        frame_total = 0
+
+
+        try:
+            vehicles = world.get_actors().filter('vehicle.*')
+            pedestrians = world.get_actors().filter('walker.pedestrian.*')
+
+            # 用于存放行为的状态
+            behavior_state_name = []
+            behavior_state_name_speed = []
+
+            scene_final=()
+            scene_length_final =10
+            space_frame = 13
+
+
+            # 主循环
+            while True:
+                print('\n')
+                print('This is frame : ',frame_total)
+                frame_total += 1
+
+                # 实时计算他车与自车之间的距离
+                if walker and front_vehicle:
+                    front_location = front_vehicle.get_location()
+                    front_vehicle_bounding_box =front_vehicle.bounding_box    # 获取车辆的长度
+                    walker_location = walker.get_location()
+                    ego_location = ego_vehicle.get_location()
+                    distance_ego = math.sqrt(
+                        (front_location.x - ego_location.x) ** 2 +
+                        (front_location.y - ego_location.y) ** 2 +
+                        (front_location.z - ego_location.z) ** 2
+                    ) - front_vehicle_bounding_box.extent.x * 2
+                    # 计算欧几里得距离
+                    distance = math.sqrt(
+                        (front_location.x - walker_location.x) ** 2 +
+                        (front_location.y - walker_location.y) ** 2 +
+                        (front_location.z - walker_location.z) ** 2
+                    )-front_vehicle_bounding_box.extent.x       # 计算的是中心距离，因此减去车的车头长度是合理的
+
+                    print(f"Distance is : {distance:.2f} 米")
+                    dis_y = abs(front_location.y - walker_location.y)
+                    print(f"Y distance is : {dis_y:.2f}m")
+
+                    if 710<= frame_total<810:
+                        front_control.steer = -0.017
+                        front_vehicle.apply_control(front_control)
+                    if 810<=frame_total <835:
+                        front_control.steer = 0.035
+                        front_vehicle.apply_control(front_control)
+                    #
+                    # if distance_ego <5 and dis_y >= 1.5:
+                    #     print('finish simulation!')
+                    #     # 保存图像
+                    #     resized_top_view_image = resize_image(top_view_image, 800, 600)
+                    #     cv2.imwrite(file_path + 'raw_image/' + str(txt_number) + '.jpg', resized_top_view_image)
+                    #     break
+
+                if frame_total == 835:
+                    print('finish simulation!')
+                    # 保存图像
+                    resized_top_view_image = resize_image(top_view_image, 800, 600)
+                    cv2.imwrite(file_path + 'raw_image/' + str(txt_number) + '.jpg', resized_top_view_image)
+                    break
+
+                if top_view_image is not None:
+                    # 显示顶置俯视图像
+                    resized_top_view_image = resize_image(top_view_image, 800, 600)
+                    cv2.imshow('Top View Camera', resized_top_view_image)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+
+                if keyboard.is_pressed('esc'):
+                    print("检测到 'Esc' 键，退出程序。")
+                    break
+
+
+
+                try:
+                    ############ >>>>>>>>>>>> TKG <<<<<<<<<<< ###########
+                    #### 获取周围车辆信息
+                    ego_location = ego_vehicle.get_location()
+                    ego_forward_vector = ego_vehicle.get_transform().get_forward_vector()  # 自车朝向向量
+
+                    frame_participants_list=()   # 空元组
+                    for vehicle in vehicles:
+                        if vehicle.id == ego_vehicle.id:   # 排除本车
+                            continue
+                        vehicle_transform = vehicle.get_transform()  # Get the transform (position and orientation)
+                        vehicle_location = vehicle_transform.location  # Extract the location
+                        vehicle_velocity = vehicle.get_velocity()  # Get the velocity vector
+                        velocity_other = 3.6 * math.sqrt(vehicle_velocity.x ** 2 + vehicle_velocity.y ** 2 + vehicle_velocity.z ** 2)
+
+                        # acceleration_other = ego_vehicle.get_acceleration()  # 获取加速度
+                        # print(f"加速度 (x, y, z): ({acceleration_other.x:.2f}, {acceleration_other.y:.2f}, {acceleration_other.z:.2f})")
+
+                        distance = ego_location.distance(vehicle_location)     # 减去车道宽度
+                        direction_vector = carla.Vector3D(
+                            x=vehicle_location.x - ego_location.x,
+                            y=vehicle_location.y - ego_location.y,
+                            z=0  # 仅考虑平面上的夹角
+                        )
+                        angle = calculate_angle_between_vectors(ego_forward_vector, direction_vector)
+                        # print(f"自车与前方车辆的夹角: {angle:.2f}°（以自车正前方为0°）")
+                        # 将角度转换为弧度
+                        angle_radians = math.radians(angle)
+                        # 使用 sin(angle) * distance 计算水平方向的距离
+                        horizontal_distance = math.sin(angle_radians) * distance
+                        # print(f"基于角度和距离计算的水平距离: {horizontal_distance:.2f} 米")
+
+                        # 根据水平距离判别出所在的车道信息,  阈值设定的原因来自Carla自身的车道宽度
+                        if horizontal_distance >=3:
+                            lane = "lane_4"
+                        else:
+                            if horizontal_distance <= -6.5:
+                                lane = "lane_1"
+                            elif  -6.5< horizontal_distance <= -3:
+                                lane = "lane_2"
+                            else:
+                                lane = "lane_3"
+
+                        # Print vehicle information
+                        # print(f"Vehicle ID: {vehicle.id},{vehicle.type_id},{lane}")
+                        # print(f"Location (x, y, z, distence): ({vehicle_location.x:.2f}, {vehicle_location.y:.2f}, {vehicle_location.z:.2f},{distance:.2f})")
+                        print(f"Velocity : ({velocity_other:.2f})")
+                        # print("-" * 30)
+
+                        ## 判别速度类别
+                        velocity_other = round(velocity_other,1)
+                        if velocity_other <= 1 :
+                            speed_ = "static"
+                        elif 1< velocity_other <= 10:
+                            speed_ = "extremely-slow"
+                        elif 10< velocity_other <= 20:
+                            speed_ = "very-slow"
+                        elif 20< velocity_other <= 30:
+                            speed_ = "slow"
+                        elif 30 < velocity_other <= 40:
+                            speed_ = "low-normal"
+                        elif 40< velocity_other <= 50:
+                            speed_ = "normal"
+                        elif 50< velocity_other <= 60:
+                            speed_ = "high-normal"
+                        elif 60 < velocity_other <= 80:
+                            speed_ = "fast"
+                        elif 80< velocity_other <= 100:
+                            speed_ = "very-fast"
+                        elif 100< velocity_other <= 120:
+                            speed_ = "extremely-fast"
+                        else:
+                            speed_ = "dangerous-fast"
+
+                        ## 判别方位
+                        if 0<=angle <20:
+                            ego_car_ = "front"
+                        elif 20<=angle <60:
+                            ego_car_ = "right_front"
+                        elif 60<= angle:
+                            ego_car_ = "right_side"
+                        elif -20<=angle<0:
+                            ego_car_ = "front"
+                        elif -60<=angle<-20:
+                            ego_car_ = "left_front"
+                        else:
+                            ego_car_ = "left_side"
+
+                        # 取绝对值的角度
+                        angle = abs(angle)
+                        if 0<= angle <15:
+                            angle_ = "angle-0-15"
+                        elif 15<= angle <25:
+                            angle_ = "angle-15-25"
+                        elif 25<= angle <35:
+                            angle_ = "angle-25-35"
+                        elif 35<= angle <45:
+                            angle_ = "angle-35-45"
+                        elif 45<= angle <55:
+                            angle_ = "angle-45-55"
+                        elif 55<= angle <65:
+                            angle_ = "angle-55-65"
+                        elif 65<= angle <75:
+                            angle_ = "angle-65-75"
+                        elif 75<= angle <80:
+                            angle_ = "angle-75-80"
+                        elif 80<= angle <90:
+                            angle_ = "angle-80-90"
+                        else:
+                            angle_ = "angle-90-180"
+
+                        ## 判别距离
+                        distance = abs(distance)
+                        if 0<= distance <4:
+                            distance_ = "dis-1"
+                        elif 4<= distance <6:
+                            distance_ = "dis-2"
+                        elif 6<= distance <8:
+                            distance_ = "dis-3"
+                        elif 8<= distance <10:
+                            distance_ = "dis-4"
+                        elif 10<= distance <14:
+                            distance_ = "dis-5"
+                        elif 14<= distance <20:
+                            distance_ = "dis-6"
+                        elif 20<= distance <30:
+                            distance_ = "dis-7"
+                        elif 30<= distance <40:
+                            distance_ = "dis-8"
+                        else:
+                            distance_ = "dis-9"
+
+                        #########  行为判别
+                        if frame_total % space_frame == 1:
+                            if vehicle.id in behavior_state_name:
+                                print(vehicle.id, 'is in behavior_state_name. ',
+                                      behavior_state_name.index(vehicle.id))
+
+                                if len(behavior_state_name_speed[behavior_state_name.index(vehicle.id)]) < 15:
+                                    behavior_state_name_speed[behavior_state_name.index(vehicle.id)].append(
+                                        velocity_other)
+                                else:
+                                    behavior_state_name_speed[behavior_state_name.index(vehicle.id)].pop(0)
+                                    behavior_state_name_speed[behavior_state_name.index(vehicle.id)].append(
+                                        velocity_other)
+                            else:
+                                behavior_state_name.append(vehicle.id)
+                                behavior_state_name_speed.append([velocity_other, ])
+                                print('behavior_state_name adding:', vehicle.id)
+
+                        speed_dis = round(behavior_state_name_speed[behavior_state_name.index(vehicle.id)][-1] - behavior_state_name_speed[behavior_state_name.index(vehicle.id)][0],0)
+                        # print(speed_dis)
+                        if speed_dis<= -8:
+                            behavior_ = 'hash_slow'
+                        elif -8<speed_dis<=-3:
+                            behavior_ = 'speed_down'
+                        elif -3< speed_dis<=3:
+                            behavior_ = 'uniform'
+                        elif 3<speed_dis<8:
+                            behavior_ = 'speed_up'
+                        else:
+                            behavior_ = 'hash_up'
+
+                        frame_participants_list = frame_participants_list +(("v"+str(vehicle.id),"vehicle", "car",lane,"speed","position","angle",(speed_,angle_,distance_,ego_car_), behavior_),)
+                    # print(behavior_state_name)
+                    # print(behavior_state_name_speed)
+
+                    #### 获取周围行人的信息
+                    for pedestrian in pedestrians:
+                        pedestrian_transform = pedestrian.get_transform()  # Get the transform (position and orientation)
+                        pedestrian_location = pedestrian_transform.location  # Extract the location
+
+                        distance_p = ego_location.distance(pedestrian_location)
+                        direction_vector = carla.Vector3D(
+                            x=pedestrian_location.x - ego_location.x,
+                            y=pedestrian_location.y - ego_location.y,
+                            z=0  # 仅考虑平面上的夹角
+                        )
+                        angle = calculate_angle_between_vectors(ego_forward_vector, direction_vector)
+                        # print(f"自车与前方行人的夹角: {angle:.2f}°（以自车正前方为0°）")
+                        # 将角度转换为弧度
+                        angle_radians = math.radians(angle)
+                        # 使用 sin(angle) * distance 计算水平方向的距离
+                        horizontal_distance = math.sin(angle_radians) * distance_p
+                        # print(f"基于角度和距离计算的水平距离: {horizontal_distance:.2f} 米")
+                        # Print pedestrian information
+                        # print(f"Pedestrian ID: {pedestrian.id}")
+                        # print(
+                        #     f"Location (x, y, z): ({pedestrian_location.x:.2f}, {pedestrian_location.y:.2f}, {pedestrian_location.z:.2f},{distance_p:.2f})")
+                        # print("-" * 30)
+
+                        ## 判别方位
+                        if 0<=angle <20:
+                            ego_p_ = "front"
+                        elif 20<=angle <60:
+                            ego_p_ = "right_front"
+                        elif 60<= angle:
+                            ego_p_ = "right_side"
+                        elif -20<=angle<0:
+                            ego_p_ = "front"
+                        elif -60<=angle<-20:
+                            ego_p_ = "left_front"
+                        else:
+                            ego_p_ = "left_side"
+                        ## 判别角度
+                        # 取绝对值的角度
+                        angle = abs(angle)
+                        if 0 <= angle < 15:
+                            angle_ = "angle-0-15"
+                        elif 15 <= angle < 25:
+                            angle_ = "angle-15-25"
+                        elif 25 <= angle < 35:
+                            angle_ = "angle-25-35"
+                        elif 35 <= angle < 45:
+                            angle_ = "angle-35-45"
+                        elif 45 <= angle < 55:
+                            angle_ = "angle-45-55"
+                        elif 55 <= angle < 65:
+                            angle_ = "angle-55-65"
+                        elif 65 <= angle < 75:
+                            angle_ = "angle-65-75"
+                        elif 75 <= angle < 80:
+                            angle_ = "angle-75-80"
+                        elif 80 <= angle < 90:
+                            angle_ = "angle-80-90"
+                        else:
+                            angle_ = "angle-90-180"
+
+                        ## 判别距离
+                        distance = abs(distance_p)
+                        if 0 <= distance < 4:
+                            distance_ = "dis-1"
+                        elif 4 <= distance < 6:
+                            distance_ = "dis-2"
+                        elif 6 <= distance < 8:
+                            distance_ = "dis-3"
+                        elif 8 <= distance < 10:
+                            distance_ = "dis-4"
+                        elif 10 <= distance < 14:
+                            distance_ = "dis-5"
+                        elif 14 <= distance < 20:
+                            distance_ = "dis-6"
+                        elif 20 <= distance < 30:
+                            distance_ = "dis-7"
+                        elif 30 <= distance < 40:
+                            distance_ = "dis-8"
+                        else:
+                            distance_ = "dis-9"
+
+                        if horizontal_distance <= 2:
+                            lane_p = "lane_3"
+                        else:
+                            lane_p = "lane_4"
+
+                        if distance <2:
+                            print('*** Adding person to TKG! ***')
+                            frame_participants_list = frame_participants_list +(("p"+str(pedestrian.id), "person", "man", lane_p, "speed","position","angle",( "fast",angle_,distance_,ego_p_), "uniform"),)
+                    # print('current list: ',frame_participants_list)
+
+                    ego_vehicle_velocity = ego_vehicle.get_velocity()  # Get the velocity vector
+                    ego_velocity = 3.6 * math.sqrt(ego_vehicle_velocity.x ** 2 + ego_vehicle_velocity.y ** 2 + ego_vehicle_velocity.z ** 2)
+                    ## 判别速度类别
+                    if ego_velocity <= 1:
+                        speed_ego = "static"
+                    elif 1 < ego_velocity <= 10:
+                        speed_ego = "extremely-slow"
+                    elif 10 < ego_velocity <= 20:
+                        speed_ego = "very-slow"
+                    elif 20 < ego_velocity <= 30:
+                        speed_ego = "slow"
+                    elif 30 < ego_velocity <= 40:
+                        speed_ego = "low-normal"
+                    elif 40 < ego_velocity <= 50:
+                        speed_ego = "normal"
+                    elif 50 < ego_velocity <= 60:
+                        speed_ego = "high-normal"
+                    elif 60 < ego_velocity <= 80:
+                        speed_ego = "fast"
+                    elif 80 < ego_velocity <= 100:
+                        speed_ego = "very-fast"
+                    elif 100 < ego_velocity <= 120:
+                        speed_ego = "extremely-fast"
+                    else:
+                        speed_ego = "dangerous-fast"
+
+
+                    if frame_total % space_frame ==1:    ################ ############  每10帧增加一个关键帧
+                        if len(traffic_participants_list)<10:
+                            print('traffic_participants_list & ego_information_list is less than 15.')
+                            traffic_participants_list = traffic_participants_list + (frame_participants_list,)
+
+                            ego_information_list = ego_information_list + ( (("ego","vehicle","lane_3","speed",(speed_ego,"height","width")),), )
+
+                        else:
+                            print('traffic_participants_list length is 15.')
+                            traffic_participants_list = traffic_participants_list[1:]
+                            traffic_participants_list = traffic_participants_list + (frame_participants_list,)
+
+                            ego_information_list = ego_information_list[1:]
+                            ego_information_list = ego_information_list + ( (("ego", "vehicle", "lane_3", "speed", (speed_ego, "height", "width")),),)
+
+                    # print(traffic_participants_list)
+                    # print(len(traffic_participants_list))
+
+
+                    scene = (road_structure_list,
+                             road_facility_list,
+                             road_change_list,
+                             traffic_participants_list,
+                             weather_list,
+                             digital_information_list,
+                             ego_information_list
+                             )
+
+                    # scene_length = scene_length_final   # 5个关键帧
+                    #####  调用TKG生成GCN训练数据
+                    if len(traffic_participants_list) >= 10 and frame_total % space_frame ==1:
+                        scene_final = scene
+                        # TKG, tkg_node_feature_matrix, tkg_edge_index_list, tkg_edge_type_list = AVKG_3D_simple(
+                        # scene, scene_length, 4800, 4800, 4800,
+                        # is_visualization=False, is_export_triple=False, is_export_gnn=True
+                        # )
+                        # print('\n')
+                        # 打印
+                        # print('Current TRGCN data is :','\t')
+                        # print(len(tkg_node_feature_matrix), len(tkg_edge_index_list), len(tkg_edge_type_list))
+                    # print(tkg_node_feature_matrix, tkg_edge_index_list, tkg_edge_type_list)
+
+                    ############ >>>>>>>>>>>> TRGCN <<<<<<<<<<< ###########
+                    # # 将 numpy.ndarray 转换为 torch.tensor
+                    # new_node_feature = torch.tensor(tkg_node_feature_matrix, dtype=torch.float).to(device)
+                    # new_edge_index = torch.tensor(tkg_edge_index_list, dtype=torch.long).t().to(device)  # 转置，变为[2,n]
+                    # new_edge_attr = torch.tensor(tkg_edge_type_list, dtype=torch.long).to(device)
+                    # # print(new_edge_index)
+                    # t_predict_front = time.time()
+                    # p = mrgcn(new_node_feature, new_edge_index, new_edge_attr, device, is_topkpool=False,
+                    #           batch=None)  # 图卷积内容
+                    # t_predict_after = time.time()
+                    # time_taken_milliseconds = (t_predict_after - t_predict_front) * 1000
+                    # print("This frame risk predict time is:", time_taken_milliseconds, "milliseconds")
+
+
+
+                except Exception as e:
+                    print(f"Error in AVKG_3D_simple function: {e}")
+
+            cv2.destroyAllWindows()
+            print('finish and we will visualize final graph!')
+            TKG, tkg_node_feature_matrix, tkg_edge_index_list, tkg_edge_type_list = AVKG_3D_simple(
+                scene_final, scene_length_final, 4800, 4800, 4800,
+                is_visualization=True, is_export_triple=False, is_export_gnn=True
+            )
+            print('Current TRGCN data length is :', '\t')
+            print(len(tkg_node_feature_matrix), len(tkg_edge_index_list), len(tkg_edge_type_list))
+
+            with open(file_path + 'tkgcn_dataset/data' + str(txt_number) + '.txt', 'w') as f:
+                # 写入 new_node_feature
+                f.write('new_node_feature:\n')
+                np.savetxt(f, tkg_node_feature_matrix, fmt='%.0f')
+                # 添加空行作为分隔符
+                f.write('\n\n')
+                # 写入 new_edge_index
+                f.write('new_edge_index:\n')
+                np.savetxt(f, tkg_edge_index_list, fmt='%d')
+                # 添加空行作为分隔符
+                f.write('\n\n')
+                # 写入 new_edge_attr
+                f.write('new_edge_attr:\n')
+                np.savetxt(f, tkg_edge_type_list, fmt='%.0f')
+                # 添加空行作为分隔符
+                f.write('\n\n')
+                np.savetxt(f, dangerous_type[0], fmt='%f')
+
+
+
+        except KeyboardInterrupt:
+            print("\n检测到退出信号，正在销毁车辆...")
+        finally:
+            # 清理资源
+            top_view_camera.stop()
+            top_view_camera.destroy()
+            walker.destroy()
+            ego_vehicle.destroy()
+            front_vehicle.destroy()
+            # other_vehicle.destroy()
+            # other_vehicle_2.destroy()
+            # other_vehicle_3.destroy()
+            # other_vehicle_4.destroy()
+            cv2.destroyAllWindows()
+            print("车辆已销毁。程序结束。")
+
+    except Exception as e:
+        print(f"发生错误: {e}")
+        cv2.destroyAllWindows()
+
+
+if __name__ == '__main__':
+    main()
