@@ -7,7 +7,7 @@ We propose a novel, knowledge-driven framework that enables autonomous vehicles 
 <img src="asset/TKG_RGCN.png" width="500">
 We propose an interpretable, proactive risk prediction method for autonomous driving based on Knowledge Graphs (KG) and Relational Graph Convolutional Networks (RGCN), designed to anticipate potential hazards—such as "ghost probe" scenarios—before they occur. The approach first models the dynamic driving environment as a Temporal Knowledge Graph (TKG), where nodes represent traffic participants and environmental elements, and edges encode semantic relationships along with spatio-temporal interactions. Subsequently, an enhanced RGCN model, termed TKGCN, is introduced, which integrates global scene features and employs a multi-layer, relation-aware message-passing mechanism to learn risk representations for each entity, enabling scene-level risk prediction 0.4–0.8 seconds prior to the actual hazardous event. To further improve interpretability, the system incorporates an Event Knowledge Graph (EKG) reasoning engine that identifies high-risk source entities (e.g., pedestrians suddenly stepping into the road or vehicles braking abnormally) and generates human-understandable decision rationales.
 
-## project code
+## Project Code
 dataset/raw_image            # Display the scene image corresponding to each dataset
 dataset/tkgcn_dataset        # The dataset used for training or validation
 
